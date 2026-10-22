@@ -18,12 +18,11 @@ export async function createChatParamsHook(ctx: PluginContext): Promise<(() => P
         }
 
         try {
-            // Get base URL and original model ID from catalog
-            const providers = await ctx.catalog.provider.list()
-            const provider = providers.data?.find((p: any) => p.id === 'llama.cpp')
+            // Read OpenCode's resolved provider settings.
+            const {data: provider} = await ctx.provider.get({providerID})
 
             if (!provider) {
-                log.warn("Provider not found in catalog")
+                log.warn("Provider not found")
                 return
             }
 

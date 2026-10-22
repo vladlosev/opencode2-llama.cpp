@@ -7,7 +7,7 @@ OpenCode V2 plugin for enhanced llama.cpp support with auto-detection, dynamic m
 ## Features
 
 - **Auto-detection**: Automatically detects a llama.cpp server running on common ports (1234, 8080, 11434)
-- **Dynamic Model Discovery**: Queries llama.cpp's `/v1/models` endpoint and registers discovered models into the OpenCode catalog (V2 API)
+- **Dynamic Model Discovery**: Queries llama.cpp's `/v1/models` endpoint and registers discovered models into the OpenCode provider registry (V2 API)
 - **Enriched Model Metadata**:
   - Human-readable display names, preferring the name provided by the API (e.g., "Qwen3 30B A3B" instead of "qwen/qwen3-30b-a3b")
   - Context limit from `context_length` / `context_window`
@@ -17,7 +17,7 @@ OpenCode V2 plugin for enhanced llama.cpp support with auto-detection, dynamic m
   - Input/output modalities, with embedding models classified accordingly
 - **Organization Owner Extraction**: Extracts and sets the `organizationOwner` field from model IDs
 - **Model Validation**: A session context hook verifies that the selected model is actually loaded on the server (with retry/backoff) and adds a system warning to the prompt if it is not
-- **Periodic Refresh**: Re-discovers models every 60 seconds and reloads the catalog
+- **Periodic Refresh**: Re-discovers models every 60 seconds and reloads the providers
 - **Health Check Monitoring**: Verifies the llama.cpp server is accessible before attempting operations
 - **Caching**: A single shared model status cache reduces redundant API calls
 - **Error Handling**: Smart error categorization with actionable messages
@@ -36,12 +36,12 @@ Add the plugin to your `opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "opencode-plugin-llama.cpp"
   ],
   "providers": {
     "llama.cpp": {
-      "npm": "@ai-sdk/openai-compatible",
+      "package": "@opencode/ai/providers/openai-compatible",
       "name": "llama.cpp (local)",
       "settings": {
         "baseURL": "http://127.0.0.1:1234"
@@ -69,12 +69,12 @@ You can also manually configure the provider with specific models:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
+  "plugins": [
     "opencode-plugin-llama.cpp"
   ],
   "providers": {
     "llama.cpp": {
-      "npm": "@ai-sdk/openai-compatible",
+      "package": "@opencode/ai/providers/openai-compatible",
       "name": "llama.cpp (local)",
       "settings": {
         "baseURL": "http://127.0.0.1:1234"
@@ -88,13 +88,13 @@ The plugin will automatically discover and register any additional models availa
 
 ## How It Works
 
-1. On OpenCode startup, the plugin's `setup` function runs and resolves the llama.cpp base URL:
-   1. It reads `opencode.json` / `opencode.jsonc` files (global and project-level), supporting both V1 (`provider.options.baseURL`) and V2 (`providers.settings.baseURL`) formats
-   2. If not found, it falls back to the OpenCode provider catalog
-   3. If still not found, it auto-detects a llama.cpp server on localhost ports 1234, 8080, and 11434
+1. On OpenCode startup, the plugin resolves llama.cpp endpoints through
+   `ctx.provider.get()`, using OpenCode's merged configuration. Provider settings
+   applied after plugin setup are picked up on `provider.updated`. If no endpoint
+   is configured, localhost ports 1234, 8080, and 11434 are probed.
 2. If a server is found, its health is checked via the `/v1/models` endpoint
 3. Discovered models are registered into the `llama.cpp` provider in the OpenCode catalog, enriched with metadata (display name, limits, capabilities, modalities, organization owner)
-4. Models are re-discovered every 60 seconds and the catalog is reloaded
+4. Models are re-discovered every 60 seconds and the providers are reloaded
 5. On every chat request, a session context hook validates that the selected model is loaded on the server (with retry/backoff); if validation fails, a warning is added to the system prompt
 
 ## Debugging
@@ -111,7 +111,7 @@ Log lines are prefixed with `[opencode-llama-cpp]`.
 
 - OpenCode (V2)
 - llama.cpp server running locally (default port: 1234)
-- Node.js 18+ (global `fetch`)
+- Node.js 22.19.0+ (global `fetch`)
 
 ## Development
 
@@ -131,3 +131,6 @@ MIT
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+Run `pnpm test:opencode` with OpenCode in PATH to verify directory loading
+and configured discovery in a temporary HOME and isolated service.

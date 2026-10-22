@@ -18,18 +18,18 @@ export const LlamaCppPlugin = Plugin.define({
     async setup(ctx) {
         log.info("llama.cpp plugin initialized")
 
-        // Register catalog transform for auto-detection and model discovery
-        const configCleanup = await createConfigHook(ctx)
+        // Register provider transform for auto-detection and model discovery
+        const config = await createConfigHook(ctx)
 
         // Register session hook for model validation
         const chatCleanup = await createChatParamsHook(ctx)
 
         // Register event subscription
-        const eventCleanup = createEventHook(ctx)
+        const eventCleanup = createEventHook(ctx, config.refreshConfiguration)
 
         // Return cleanup function
         return async () => {
-            if (configCleanup) await configCleanup()
+            await config.cleanup()
             if (chatCleanup) await chatCleanup()
             if (eventCleanup) eventCleanup()
         }

@@ -3,13 +3,16 @@ import {log} from '../utils/log'
 
 type PluginContext = Plugin.Context
 
-export function createEventHook(ctx: PluginContext): (() => void) {
+export function createEventHook(ctx: PluginContext, refreshConfiguration: () => Promise<void>): (() => void) {
     const controller = new AbortController()
 
     // Subscribe to server events
     void (async () => {
         try {
             for await (const event of ctx.event.subscribe({signal: controller.signal})) {
+                if (event.type === 'provider.updated' && event.location?.directory === ctx.location.directory) {
+                    await refreshConfiguration()
+                }
                 // Monitor session events
                 if (event.type === "session.created") {
                     log.debug(`Session event: ${event.type}`)
