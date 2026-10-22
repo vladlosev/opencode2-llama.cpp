@@ -36,6 +36,11 @@ When you run OpenCode in TUI mode, check the console output for these log messag
    - Look for: `configFrozen: true` in the debug log
    - If true: OpenCode might be passing a frozen config object
 
+6. **Is each llama.cpp provider recognized?**
+   - Use provider ID `llama.cpp` or set `canonical` to exactly `llama.cpp`.
+   - An ID prefix (such as `llama.cpp.localhost`) is not sufficient.
+   - Check each provider's `settings.baseURL` endpoint separately.
+
 ### Common Issues
 
 #### Issue: Models not showing in OpenCode

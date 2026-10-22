@@ -1,4 +1,4 @@
-// Verify directory loading and late provider configuration in an isolated host.
+// Verify multiple canonical providers and directory loading in an isolated host.
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
 import {createServer} from 'node:http'
@@ -31,20 +31,37 @@ function run(args) {
         })
     })
 }
-const fixture = createServer((request, response) => {
-    assert.equal(request.url, '/v1/models')
-    response.setHeader('Content-Type', 'application/json')
-    response.end(JSON.stringify({data: [{id: 'fixture-model', name: 'Fixture Model', created: 1700000000,
-        context_length: 32768, capabilities: {function_calling: true}}]}))
-})
-await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve))
+let unexpectedRequests = 0
+function fixture(id, context) {
+    return createServer((request, response) => {
+        if (request.url !== '/v1/models') {
+            unexpectedRequests++
+            response.writeHead(404).end()
+            return
+        }
+        response.setHeader('Content-Type', 'application/json')
+        response.end(JSON.stringify({data: [{id, name: id, created: 1700000000,
+            context_length: context, capabilities: {function_calling: true}}]}))
+    })
+}
+const first = fixture('first-model', 32768)
+const second = fixture('second-model', 8192)
+for (const server of [first, second]) await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+const firstURL = `http://127.0.0.1:${first.address().port}/v1`
+const secondURL = `http://127.0.0.1:${second.address().port}/v1`
+const provider = (baseURL, canonical) => ({...(canonical ? {canonical} : {}),
+    package: '@opencode/ai/providers/openai-compatible', settings: {baseURL}})
 let success = false
 try {
     assert.match(await run(['--version']), /\bv2\.1\.2\b/, 'Use OpenCode 2.1.2 for this compatibility test')
     await writeFile(join(root, 'opencode.jsonc'), JSON.stringify({
         plugins: [repo],
-        providers: {'llama.cpp': {package: '@opencode/ai/providers/openai-compatible',
-            settings: {baseURL: `http://127.0.0.1:${fixture.address().port}/v1`}}},
+        providers: {
+            'llama.cpp': provider(firstURL),
+            'local-models': provider(secondURL, 'llama.cpp'),
+            'llama.cpp.named': provider(firstURL, 'llama.cpp'),
+            'llama.cpp.ignored': provider(`${secondURL}/ignored`),
+        },
     }))
     const reservation = createServer()
     await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve))
@@ -53,25 +70,35 @@ try {
     await run(['service', 'set', 'port', String(port)])
     const api = async path => JSON.parse(await run(['api', 'get',
         `${path}?${new URLSearchParams({'location[directory]': root})}`])).data
-    let plugin, model
+    const expected = [
+        ['llama.cpp', 'first-model', 32768],
+        ['local-models', 'second-model', 8192],
+        ['llama.cpp.named', 'first-model', 32768],
+    ]
+    let plugin, models = []
     const deadline = Date.now() + 30000
     do {
         plugin = (await api('/api/plugin')).find(item => item.id === 'llama-cpp' || item.source?.path?.startsWith(repo))
         if (plugin?.state.status === 'failed') break
-        model = (await api('/api/model')).find(item => item.providerID === 'llama.cpp' && item.id === 'fixture-model')
-        if (plugin?.state.status === 'active' && model) break
+        models = await api('/api/model')
+        if (plugin?.state.status === 'active' && expected.every(([providerID, id]) => models.some(model => model.providerID === providerID && model.id === id))) break
         await delay(100)
     } while (Date.now() < deadline)
     assert.equal(plugin?.state.status, 'active', JSON.stringify(plugin))
-    assert.ok(model, 'The plugin must discover the endpoint configured after its setup')
-    assert.equal(model.name, 'Fixture Model')
-    assert.equal(model.limit.context, 32768)
-    assert.equal(model.capabilities.tools, true)
+    for (const [providerID, id, context] of expected) {
+        const model = models.find(model => model.providerID === providerID && model.id === id)
+        assert.ok(model, `The plugin must discover ${id} for ${providerID}`)
+        assert.equal(model.limit.context, context)
+        assert.equal(model.capabilities.tools, true)
+    }
+    assert.ok(!models.some(model => model.providerID === 'local-models' && model.id === 'first-model'), 'Endpoint inventories must stay separate')
+    assert.ok(!models.some(model => model.providerID === 'llama.cpp.ignored'), 'An ID prefix alone must not enable discovery')
+    assert.equal(unexpectedRequests, 0)
     success = true
-    console.log('OpenCode 2.1.2 smoke test passed: directory plugin active; configured models discovered.')
+    console.log('OpenCode 2.1.2 smoke test passed: exact-ID and canonical providers discovered across two endpoints; prefix-only provider ignored.')
 } finally {
     await run(['service', 'stop']).catch(() => {})
-    await new Promise(resolve => fixture.close(resolve))
+    for (const server of [first, second]) await new Promise(resolve => server.close(resolve))
     if (success) await rm(root, {recursive: true, force: true})
     else console.error(`Isolated diagnostics retained at ${root}`)
 }

@@ -9,12 +9,15 @@ import {categorizeModel, extractModelOwner, formatModelName} from '../utils'
 import {autoDetectLlamaCpp, checkLlamaCppHealth, discoverLlamaCppModels, normalizeBaseURL} from '../utils/llama-cpp-api'
 import type {LlamaCppModel} from '../types'
 import {log} from '../utils/log'
+import {isLlamaCppProvider} from './provider-options'
 
 // Default llama.cpp URL
 const DEFAULT_LLAMA_CPP_URL = "http://127.0.0.1:1234"
 
 // Discovery belongs to the current OpenCode location.
 interface DiscoveryState {
+    providerID: string
+    automatic: boolean
     cachedBaseURL: string | null
     models: LlamaCppModel[]
     stopped: boolean
@@ -76,33 +79,76 @@ function readBaseURLFromConfig(ctx: PluginContext): string | null {
 }
 
 export async function createConfigHook(ctx: PluginContext) {
-    const state: DiscoveryState = {cachedBaseURL: null, models: [], stopped: false}
+    const states = new Map<string, DiscoveryState>()
+    let stopped = false
+    let configuredPreviously = false
+    let configuration: string | undefined
+
+    async function refreshConfiguration(initial = false) {
+        const available = (await ctx.provider.list()).data.filter(isLlamaCppProvider)
+        // Explicit provider configuration creates an integration; autodetection
+        // does not. Distinguish our own contribution from configured endpoints.
+        const integrations = new Set((await ctx.integration.list()).data.map(item => item.id))
+        if (stopped) return
+        const configured = available.filter(provider => !states.get(provider.id)?.automatic || integrations.has(provider.id))
+        let providers: Array<{id: string, automatic: boolean, baseURL: string}> = configured.map(provider => ({id: provider.id, automatic: false,
+            baseURL: normalizeBaseURL(typeof provider.settings?.baseURL === 'string' ? provider.settings.baseURL : undefined)}))
+        if (initial && !providers.length) {
+            const baseURL = readBaseURLFromConfig(ctx)
+            if (baseURL) providers = [{id: 'llama.cpp', automatic: false, baseURL: normalizeBaseURL(baseURL)}]
+        }
+        if (providers.length) configuredPreviously = true
+        const next = JSON.stringify(providers.map(provider => [provider.id, provider.baseURL]).sort())
+        if (next === configuration) return
+        configuration = next
+        if (!providers.length && !configuredPreviously) {
+            if (!states.size) providers = [{id: 'llama.cpp', automatic: true, baseURL: ''}]
+            else return
+        }
+        for (const [id, state] of states) {
+            if (providers.some(provider => provider.id === id)) continue
+            state.stopped = true
+            await (await state.registration)?.dispose()
+            states.delete(id)
+            await ctx.provider.reload()
+        }
+        for (const provider of providers) {
+            let state = states.get(provider.id)
+            if (!state) {
+                state = {providerID: provider.id, automatic: provider.automatic, cachedBaseURL: null, models: [], stopped: false}
+                states.set(provider.id, state)
+            }
+            state.automatic = provider.automatic
+            if (stopped) return
+            await detectAndRegister(ctx, state)
+        }
+    }
+
     try {
-        // Try to detect and register llama.cpp provider
-        await detectAndRegister(ctx, state)
-
-        // Set up periodic refresh (uses cachedBaseURL — no config re-read)
+        await refreshConfiguration(true)
         const refreshInterval = setInterval(() => {
-            refreshModels(ctx, state).catch((error) => {
-                log.warn("Periodic refresh failed", {error: String(error)})
-            })
-        }, 60_000) // Refresh every 60 seconds
-
+            for (const state of states.values()) {
+                refreshModels(ctx, state).catch(error => {
+                    log.warn("Periodic refresh failed", {error: String(error)})
+                })
+            }
+        }, 60_000)
         return {
-            refreshConfiguration: async () => {
-                const result = await ctx.provider.get({providerID: 'llama.cpp'}).catch(() => undefined)
-                const baseURL = result?.data.settings?.baseURL
-                if (typeof baseURL === 'string' && normalizeBaseURL(baseURL) !== state.cachedBaseURL) {
-                    await detectAndRegister(ctx, state)
-                }
-            },
+            refreshConfiguration,
             cleanup: async () => {
-                state.stopped = true
+                stopped = true
                 clearInterval(refreshInterval)
-                await (await state.registration)?.dispose()
+                for (const state of states.values()) {
+                    state.stopped = true
+                    await (await state.registration)?.dispose()
+                }
             },
         }
     } catch (error) {
+        for (const state of states.values()) {
+            state.stopped = true
+            await (await state.registration)?.dispose()
+        }
         log.error("Failed to initialize config hook", {error: String(error)})
         throw error
     }
@@ -114,7 +160,7 @@ async function detectAndRegister(ctx: PluginContext, state: DiscoveryState): Pro
     // 1. Prefer resolved settings when OpenCode has loaded the provider.
     if (!baseURL) {
         try {
-            const {data: existingProvider} = await ctx.provider.get({providerID: 'llama.cpp'})
+            const {data: existingProvider} = await ctx.provider.get({providerID: state.providerID})
             if (existingProvider) {
                 baseURL = normalizeBaseURL(
                     (existingProvider as any).settings?.baseURL || DEFAULT_LLAMA_CPP_URL
@@ -126,10 +172,10 @@ async function detectAndRegister(ctx: PluginContext, state: DiscoveryState): Pro
     }
 
     // 2. Config files are available before OpenCode applies provider settings.
-    if (!baseURL) baseURL = readBaseURLFromConfig(ctx)
+    if (!baseURL && state.providerID === 'llama.cpp') baseURL = readBaseURLFromConfig(ctx)
 
     // 3. Auto-detect on localhost
-    if (!baseURL) {
+    if (!baseURL && state.automatic) {
         log.debug("Trying auto-detect on localhost...")
         const detectedURL = await autoDetectLlamaCpp()
         if (detectedURL) {
@@ -237,18 +283,25 @@ async function discoverAndRegister(ctx: PluginContext, baseURL: string, state: D
 
     state.models = models
     await (state.registration ??= ctx.provider.transform((catalog) => {
-        catalog.update("llama.cpp", (provider: any) => {
-            provider.name = "llama.cpp (local)"
-            provider.package ||= "@opencode/ai/providers/openai-compatible"
-            provider.activation = "enabled"
-            provider.settings = {
-                ...provider.settings,
-                baseURL: `${state.cachedBaseURL}/v1`,
+        if (state.stopped) return
+        const existing = catalog.get(state.providerID)
+        catalog.update(state.providerID, (provider: any) => {
+            // Late discoveries may register after the configuration adapter.
+            // Preserve its endpoint and activation rather than overriding them.
+            if (!existing) {
+                provider.name = "llama.cpp (local)"
+                provider.activation = state.automatic ? "enabled" : "disabled"
+                if (state.automatic) provider.canonical = "llama.cpp"
+                provider.settings = {
+                    ...provider.settings,
+                    baseURL: `${state.cachedBaseURL}/v1`,
+                }
             }
+            provider.package ||= "@opencode/ai/providers/openai-compatible"
         })
 
         for (const model of state.models) {
-            catalog.models.update("llama.cpp", model.id, (modelInfo: any) => {
+            catalog.models.update(state.providerID, model.id, (modelInfo: any) => {
                 applyModelInfo(model, modelInfo)
             })
         }
@@ -275,7 +328,7 @@ async function refreshModels(ctx: PluginContext, state: DiscoveryState): Promise
     if (!baseURL) {
         try {
             const providers = await ctx.provider.list()
-            const provider = providers.data?.find((p: any) => p.id === 'llama.cpp')
+            const provider = providers.data?.find((p: any) => p.id === state.providerID)
             if (provider) {
                 baseURL = normalizeBaseURL(
                     (provider as any).settings?.baseURL || DEFAULT_LLAMA_CPP_URL

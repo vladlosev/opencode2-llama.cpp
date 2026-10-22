@@ -10,12 +10,20 @@ import {LlamaCppPlugin} from '../index'
 
 // The 2.1.2 editor creates missing provider/model definitions on update.
 // Replaying it exercises the plugin's contribution rather than mocked calls.
-function createContext(provider?: Provider.Info, directory = '/isolated-project') {
+function createContext(provider?: Provider.Info | Provider.Info[], directory = '/isolated-project') {
     const transforms = new Set<(editor: ProviderEditor) => void>()
-    let configured = provider
+    const pipeline: Array<((editor: ProviderEditor) => void) | 'configuration'> = provider ? ['configuration'] : []
+    let configured = provider ? Array.isArray(provider) ? provider : [provider] : []
     let hook: ((event: SessionContext) => Promise<void> | void) | undefined
     let notify: (() => void) | undefined
     let eventSignal: AbortSignal | undefined
+    let pendingEvents = 0
+    const publishProviders = () => {
+        if (!eventSignal || eventSignal.aborted) return
+        pendingEvents++
+        notify?.()
+        notify = undefined
+    }
     const records = () => {
         const entries = new Map<string, ProviderRecord>()
         const entry = (id: string) => {
@@ -23,6 +31,7 @@ function createContext(provider?: Provider.Info, directory = '/isolated-project'
             return entries.get(id)!
         }
         const editor = {
+            get: (id: string) => entries.get(id),
             update: (id, update) => update(entry(id).provider as Parameters<typeof update>[0]),
             models: {update: (id, modelID, update) => {
                 const models = entry(id).models as Map<string, Model.Info>
@@ -30,29 +39,39 @@ function createContext(provider?: Provider.Info, directory = '/isolated-project'
                 update(models.get(modelID)! as Parameters<typeof update>[0])
             }},
         } as ProviderEditor
-        for (const transform of transforms) transform(editor)
-        // OpenCode's configuration adapter applies settings after user plugins.
-        if (configured) {
-            const record = entry(configured.id)
-            entries.set(configured.id, {...record, provider: {...record.provider, ...configured}})
+        // Replay actual registration order, including configuration applied
+        // after setup and plugin transforms registered still later.
+        for (const step of pipeline) {
+            if (step === 'configuration') {
+                for (const provider of configured) {
+                    const record = entry(provider.id)
+                    entries.set(provider.id, {...record, provider: {...record.provider, ...provider}})
+                }
+            } else step(editor)
         }
         return entries
     }
     const location = {directory}
     const ctx = {
         app: {version: '2.1.2'}, location, options: {},
+        integration: {list: async () => ({location, data: configured.map(provider => ({id: provider.id}))})},
         provider: {
             get: async ({providerID}: {providerID: string}) => {
                 const record = records().get(providerID)
                 if (!record) throw new Error('Provider not found')
                 return {location, data: record.provider}
             },
-            list: async () => ({location, data: [...records().values()].map(record => record.provider)}),
+            list: async () => ({location, data: [...records().values()].map(record => record.provider).filter(provider => provider.activation !== 'disabled')}),
             transform: async (transform: (editor: ProviderEditor) => void) => {
                 transforms.add(transform)
-                return {dispose: async () => { transforms.delete(transform) }}
+                pipeline.push(transform)
+                return {dispose: async () => {
+                    transforms.delete(transform)
+                    const index = pipeline.indexOf(transform)
+                    if (index >= 0) pipeline.splice(index, 1)
+                }}
             },
-            reload: async () => { records() },
+            reload: async () => { records(); publishProviders() },
         },
         session: {hook: async (_name: string, callback: typeof hook) => {
             hook = callback
@@ -62,18 +81,26 @@ function createContext(provider?: Provider.Info, directory = '/isolated-project'
             eventSignal = signal
             return (async function* () {
                 while (!signal.aborted) {
-                    await new Promise<void>(resolve => {
-                        notify = resolve
-                        signal.addEventListener('abort', () => resolve(), {once: true})
+                    if (!pendingEvents) await new Promise<void>(resolve => {
+                        const abort = () => resolve()
+                        notify = () => { signal.removeEventListener('abort', abort); resolve() }
+                        signal.addEventListener('abort', abort, {once: true})
                     })
-                    if (!signal.aborted) yield {type: 'provider.updated', location}
+                    if (!signal.aborted) {
+                        pendingEvents--
+                        yield {type: 'provider.updated', location}
+                    }
                 }
             })()
         }},
     } as unknown as Plugin.Context
     return {
         ctx, records,
-        configure: (value: Provider.Info) => { configured = value; notify?.() },
+        configure: (value: Provider.Info | Provider.Info[]) => {
+            configured = Array.isArray(value) ? value : [value]
+            if (!pipeline.includes('configuration')) pipeline.push('configuration')
+            publishProviders()
+        },
         get registrationCount() { return transforms.size },
         get eventSignal() { return eventSignal },
         request: async (providerID = 'llama.cpp', id = 'qwen/test') => {
@@ -84,8 +111,8 @@ function createContext(provider?: Provider.Info, directory = '/isolated-project'
     }
 }
 
-function configured(baseURL: string): Provider.Info {
-    return {...Provider.Info.empty(Provider.ID.make('llama.cpp')), activation: 'enabled',
+function configured(baseURL: string, id = 'llama.cpp', canonical?: string): Provider.Info {
+    return {...Provider.Info.empty(Provider.ID.make(id)), ...(canonical ? {canonical: Provider.ID.make(canonical)} : {}), activation: 'enabled',
         package: '@opencode/ai/providers/openai-compatible', settings: {baseURL}}
 }
 
@@ -97,6 +124,7 @@ describe('OpenCode 2.1.2 compatibility', () => {
 
     beforeEach(() => {
         vi.useFakeTimers()
+        vi.stubEnv('HOME', '/isolated-home')
         modelStatusCache.invalidateAll()
         inventory = [{id: 'qwen/test', name: 'Test Qwen', created: 1700000000,
             context_length: 32768, capabilities: {function_calling: true, vision: true}}]
@@ -141,7 +169,7 @@ describe('OpenCode 2.1.2 compatibility', () => {
         const context = createContext()
         await start(context)
         expect(context.records().get('llama.cpp')!.provider).toMatchObject({
-            activation: 'enabled', package: '@opencode/ai/providers/openai-compatible',
+            activation: 'enabled', canonical: 'llama.cpp', package: '@opencode/ai/providers/openai-compatible',
             settings: {baseURL: 'http://127.0.0.1:8080/v1'},
         })
         expect(context.records().get('llama.cpp')!.models.has('qwen/test')).toBe(true)
@@ -239,4 +267,108 @@ describe('OpenCode 2.1.2 compatibility', () => {
         expect((await missing).system).toEqual([expect.objectContaining({text: expect.stringContaining('missing')})])
         expect((await context.request('other', 'missing')).system).toEqual([])
     })
+    it.each([
+        ['llama.cpp', undefined, true],
+        ['local-models', 'llama.cpp', true],
+        ['llama.cpp.localhost', 'llama.cpp', true],
+        ['llama.cpp.localhost', undefined, false],
+        ['unrelated', 'llama.cpp.remote', false],
+        ['unrelated', 'Llama.cpp', false],
+    ] as const)('uses the same recognition rule for discovery and validation: %s / %s', async (id, canonical, recognized) => {
+        const context = createContext(configured('http://configured:8080/v1', id, canonical))
+        Object.assign(context.ctx.options, {providerID: 'ignored-legacy-option'})
+        await start(context)
+        expect(context.records().get(id)!.models.has('qwen/test')).toBe(recognized)
+        expect(requests.includes('http://configured:8080/v1/models')).toBe(recognized)
+        const missing = context.request(id, 'missing')
+        await vi.advanceTimersByTimeAsync(2000)
+        expect((await missing).system.length).toBe(recognized ? 1 : 0)
+    })
+
+    it('keeps simultaneous canonical providers and their validation inventories separate', async () => {
+        vi.stubGlobal('fetch', async (url: string) => {
+            requests.push(url)
+            const id = url.includes('first:') ? 'first-model' : 'second-model'
+            return Response.json({data: [{id}]})
+        })
+        const context = createContext([
+            configured('http://first:8080/v1', 'first', 'llama.cpp'),
+            configured('http://second:8080/v1', 'second', 'llama.cpp'),
+        ])
+        await start(context)
+        expect([...context.records().get('first')!.models.keys()]).toEqual(['first-model'])
+        expect([...context.records().get('second')!.models.keys()]).toEqual(['second-model'])
+        expect((await context.request('first', 'first-model')).system).toEqual([])
+        expect((await context.request('second', 'second-model')).system).toEqual([])
+        const wrongEndpoint = context.request('second', 'first-model')
+        await vi.advanceTimersByTimeAsync(2000)
+        expect((await wrongEndpoint).system).toHaveLength(1)
+    })
+
+    it.each(['canonical removed', 'disabled', 'removed'])('withdraws providers that are no longer recognized or available: %s', async mode => {
+        const provider = configured('http://configured:8080/v1', 'custom', 'llama.cpp')
+        const context = createContext(provider)
+        await start(context)
+        if (mode === 'removed') context.configure([])
+        else if (mode === 'disabled') context.configure({...provider, activation: 'disabled'})
+        else context.configure(configured('http://configured:8080/v1', 'custom'))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(context.records().get('custom')?.models.size ?? 0).toBe(0)
+        requests.length = 0
+        await vi.advanceTimersByTimeAsync(60000)
+        expect(requests).toEqual([])
+    })
+
+    it('stops an autodetected ID after explicit configuration takes ownership and is removed', async () => {
+        const context = createContext()
+        await start(context)
+        context.configure(configured('http://127.0.0.1:8080/v1'))
+        await vi.advanceTimersByTimeAsync(0)
+        context.configure([])
+        await vi.advanceTimersByTimeAsync(0)
+        requests.length = 0
+        await vi.advanceTimersByTimeAsync(60000)
+        expect(requests).toEqual([])
+    })
+
+    it('preserves prior canonical configuration when discovery registers later', async () => {
+        const provider = {...configured('http://configured:8080/v1', 'custom', 'llama.cpp'), name: 'My server'}
+        const context = createContext(provider)
+        await start(context)
+        expect(context.records().get('custom')!.provider.activation).toBe('enabled')
+        expect(context.records().get('custom')!.provider.name).toBe('My server')
+    })
+
+    it('discovers a canonical provider added after setup without a reload loop', async () => {
+        const context = createContext()
+        await start(context)
+        context.configure(configured('http://configured:8080/v1', 'custom', 'llama.cpp'))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(context.records().get('custom')!.models.has('qwen/test')).toBe(true)
+        expect(context.records().get('custom')!.provider.activation).toBe('enabled')
+        expect(context.registrationCount).toBe(1)
+    })
+
+    it('uses updated endpoint settings when discovery was registered after configuration', async () => {
+        const context = createContext()
+        await start(context)
+        context.configure(configured('http://first:8080/v1', 'custom', 'llama.cpp'))
+        await vi.advanceTimersByTimeAsync(0)
+        inventory = [{id: 'replacement'}]
+        context.configure(configured('http://second:8080/v1', 'custom', 'llama.cpp'))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(requests.at(-1)).toBe('http://second:8080/v1/models')
+        expect([...context.records().get('custom')!.models.keys()]).toEqual(['replacement'])
+    })
+
+    it('discovers the remaining canonical endpoints when one is offline', async () => {
+        const context = createContext([
+            configured('http://offline:9090/v1', 'offline', 'llama.cpp'),
+            configured('http://configured:8080/v1', 'online', 'llama.cpp'),
+        ])
+        await start(context)
+        expect(context.records().get('offline')!.models.size).toBe(0)
+        expect(context.records().get('online')!.models.has('qwen/test')).toBe(true)
+    })
+
 })
