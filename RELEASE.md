@@ -11,7 +11,7 @@ Use the GitHub Actions workflow to create releases:
 3. Click "Run workflow"
 
 The workflow will automatically:
-- Run tests and build
+- Run validation and tests
 - Bump version in package.json
 - Create git tag
 - Push to GitHub
@@ -21,7 +21,7 @@ The workflow will automatically:
 ## What the Release Script Does
 
 1. **Bumps version** in `package.json`
-2. **Runs build and tests** to ensure everything works
+2. **Runs validation and tests** to ensure everything works
 3. **Creates git tag** (e.g., `v0.1.1`)
 4. **Pushes to GitHub** (commits and tags)
 5. **Creates GitHub release** with auto-generated release notes
@@ -64,7 +64,7 @@ If the automated GitHub Actions workflow fails, you can complete it manually:
 pnpm version patch  # or minor, major
 
 # 2. Run tests
-pnpm run build
+pnpm run check
 
 # 3. Create and push tag
 git tag v0.1.1
