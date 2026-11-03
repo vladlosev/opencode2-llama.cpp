@@ -51,6 +51,25 @@ Add the plugin to your `opencode.json`:
 }
 ```
 
+### Options
+
+Configure plugin options with the object form:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "opencode-plugin-llama.cpp",
+      "options": {
+        "formatModelNames": true
+      }
+    }
+  ]
+}
+```
+
+- `formatModelNames` (default `true`): format discovered model names for display (for example, `Qwen3 30B A3B` from `qwen/qwen3-30b-a3b`). Set to `false` to keep the raw model IDs returned by llama.cpp.
+
 Both configuration formats are supported:
 
 - **V1**: `provider` with `options.baseURL`

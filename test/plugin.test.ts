@@ -157,11 +157,31 @@ describe('OpenCode 2.1.2 compatibility', () => {
 
     it('discovers configured models through the native provider editor', async () => {
         const context = createContext(configured('http://configured:8080/v1'))
+        Object.assign(context.ctx.options, {formatModelNames: true})
         await start(context)
         expect(requests.every(url => url === 'http://configured:8080/v1/models')).toBe(true)
         expect(context.records().get('llama.cpp')!.models.get('qwen/test')).toMatchObject({
             name: 'Test Qwen', modelID: 'qwen/test', providerID: 'llama.cpp',
             limit: {context: 32768}, capabilities: {tools: true, input: ['text', 'image'], output: ['text']},
+        })
+    })
+
+    it('formats model names when formatModelNames is not configured', async () => {
+        const context = createContext(configured('http://configured:8080/v1'))
+        await start(context)
+        expect(context.records().get('llama.cpp')!.models.get('qwen/test')).toMatchObject({
+            name: 'Test Qwen',
+        })
+    })
+
+    it('keeps raw model IDs when formatModelNames is disabled', async () => {
+        const context = createContext(configured('http://configured:8080/v1'))
+        Object.assign(context.ctx.options, {formatModelNames: false})
+        await start(context)
+        expect(context.records().get('llama.cpp')!.models.get('qwen/test')).toMatchObject({
+            name: 'qwen/test',
+            limit: {context: 32768},
+            capabilities: {tools: true, input: ['text', 'image'], output: ['text']},
         })
     })
 

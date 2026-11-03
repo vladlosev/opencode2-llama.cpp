@@ -19,6 +19,7 @@ interface DiscoveryState {
     providerID: string
     automatic: boolean
     cachedBaseURL: string | null
+    formatModelNames: boolean
     models: LlamaCppModel[]
     stopped: boolean
     registration?: ReturnType<PluginContext['provider']['transform']>
@@ -80,6 +81,7 @@ function readBaseURLFromConfig(ctx: PluginContext): string | null {
 
 export async function createConfigHook(ctx: PluginContext) {
     const states = new Map<string, DiscoveryState>()
+    const formatModelNames = ctx.options.formatModelNames !== false
     let stopped = false
     let configuredPreviously = false
     let configuration: string | undefined
@@ -115,7 +117,14 @@ export async function createConfigHook(ctx: PluginContext) {
         for (const provider of providers) {
             let state = states.get(provider.id)
             if (!state) {
-                state = {providerID: provider.id, automatic: provider.automatic, cachedBaseURL: null, models: [], stopped: false}
+                state = {
+                    providerID: provider.id,
+                    automatic: provider.automatic,
+                    cachedBaseURL: null,
+                    formatModelNames,
+                    models: [],
+                    stopped: false,
+                }
                 states.set(provider.id, state)
             }
             state.automatic = provider.automatic
@@ -208,8 +217,10 @@ async function detectAndRegister(ctx: PluginContext, state: DiscoveryState): Pro
     await discoverAndRegister(ctx, baseURL, state)
 }
 
-function applyModelInfo(model: LlamaCppModel, modelInfo: any) {
-    modelInfo.name = formatModelName(model)
+function applyModelInfo(model: LlamaCppModel, modelInfo: any, formatModelNames: boolean) {
+    if (formatModelNames) {
+        modelInfo.name = formatModelName(model)
+    }
 
     const owner = extractModelOwner(model.id)
     if (owner) {
@@ -302,7 +313,7 @@ async function discoverAndRegister(ctx: PluginContext, baseURL: string, state: D
 
         for (const model of state.models) {
             catalog.models.update(state.providerID, model.id, (modelInfo: any) => {
-                applyModelInfo(model, modelInfo)
+                applyModelInfo(model, modelInfo, state.formatModelNames)
             })
         }
     }))
